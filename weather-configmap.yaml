@@ -1,0 +1,133 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mpi-weather-code
+data:
+  weather_mpi.py: |
+    #!/usr/bin/env python3
+    from mpi4py import MPI
+    import numpy as np
+    import time
+    import psutil
+    import os
+
+    def get_process_metrics():
+        process = psutil.Process()
+        return {
+            'memory_mb': process.memory_info().rss / (1024 * 1024),
+            'cpu_percent': process.cpu_percent(),
+            'threads': process.num_threads()
+        }
+
+    def process_weather_data(data_size=10000):
+        # Initialize MPI
+        comm = MPI.COMM_WORLD
+        rank = comm.Get_rank()
+        size = comm.Get_size()
+
+        # Start timing
+        start_time = time.time()
+        start_metrics = get_process_metrics()
+
+        # Generate data only on rank 0
+        if rank == 0:
+            print(f"\nStarting weather data processing with {size} processes")
+            print(f"Initial metrics for master process:")
+            print(f"Memory usage: {start_metrics['memory_mb']:.2f} MB")
+            print(f"CPU usage: {start_metrics['cpu_percent']:.1f}%")
+            print(f"Number of threads: {start_metrics['threads']}")
+            
+            data = []
+            for i in range(data_size):
+                month = (i % 12) + 1
+                temp = 20 + np.random.normal(0, 5)
+                data.append((month, temp))
+            data = np.array(data)
+        else:
+            data = None
+
+        # Broadcast data size
+        if rank == 0:
+            data_size = len(data)
+        else:
+            data_size = None
+        data_size = comm.bcast(data_size, root=0)
+
+        # Calculate chunks
+        chunk_size = data_size // size
+        remainder = data_size % size
+
+        # Scatter data
+        if rank == 0:
+            chunks = []
+            start = 0
+            for i in range(size):
+                chunk_end = start + chunk_size + (1 if i < remainder else 0)
+                chunks.append(data[start:chunk_end])
+                start = chunk_end
+            local_data = chunks[0]
+            for i in range(1, size):
+                comm.send(chunks[i], dest=i)
+        else:
+            local_data = comm.recv(source=0)
+
+        # Process local data
+        process_start_time = time.time()
+        local_results = {}
+        for month, temp in local_data:
+            month = int(month)
+            if month not in local_results:
+                local_results[month] = {'sum': 0, 'count': 0}
+            local_results[month]['sum'] += temp
+            local_results[month]['count'] += 1
+        process_end_time = time.time()
+
+        # Get final metrics
+        end_metrics = get_process_metrics()
+        local_metrics = {
+            'rank': rank,
+            'process_time': process_end_time - process_start_time,
+            'start_metrics': start_metrics,
+            'end_metrics': end_metrics
+        }
+
+        # Gather results and metrics
+        all_results = comm.gather(local_results, root=0)
+        all_metrics = comm.gather(local_metrics, root=0)
+
+        # Only rank 0 prints results
+        if rank == 0:
+            end_time = time.time()
+            total_time = end_time - start_time
+
+            print("\nPerformance Summary:")
+            print(f"Total execution time: {total_time:.3f} seconds")
+            print(f"Number of processes: {size}")
+            print(f"Data size: {data_size} records")
+            
+            print("\nPer-Process Metrics:")
+            for metrics in all_metrics:
+                r = metrics['rank']
+                print(f"\nProcess {r}:")
+                print(f"Processing time: {metrics['process_time']:.3f} seconds")
+                print(f"Memory usage: {metrics['end_metrics']['memory_mb']:.2f} MB")
+                print(f"CPU usage: {metrics['end_metrics']['cpu_percent']:.1f}%")
+                print(f"Memory change: {metrics['end_metrics']['memory_mb'] - metrics['start_metrics']['memory_mb']:.2f} MB")
+
+            print("\nResults Summary:")
+            final_results = {}
+            for process_result in all_results:
+                for month, data in process_result.items():
+                    if month not in final_results:
+                        final_results[month] = {'sum': 0, 'count': 0}
+                    final_results[month]['sum'] += data['sum']
+                    final_results[month]['count'] += data['count']
+
+            for month in sorted(final_results.keys()):
+                avg = final_results[month]['sum'] / final_results[month]['count']
+                print(f"Month {month}: {avg:.2f}°C")
+
+    if __name__ == "__main__":
+        # Add a small delay to ensure all processes are ready
+        time.sleep(2)
+        process_weather_data()

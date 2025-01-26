@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mpi-hostfile
+data:
+  hostfile: |
+    localhost slots=4
